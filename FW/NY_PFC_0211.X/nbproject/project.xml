@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://www.netbeans.org/ns/project/1">
+    <type>com.microchip.mplab.nbide.embedded.makeproject</type>
+    <configuration>
+        <data xmlns="http://www.netbeans.org/ns/make-project/1">
+            <name>NY_PFC_0211</name>
+            <name>NY_PFC_0909_V002.2_noFilter_canWorking</name>
+            <name>NY_PFC_0909_V002.2_org</name>
+            <name>NY_PFC_0909_V002.2</name>
+            <name>NY_PFC_0909_V002.1_ocpprint_KP modified to unsigned</name>
+            <name>NY_PFC_0909_V002.1_ocpprint</name>
+            <name>NY_PFC_0909_V002.1_ocpprint_readyflash</name>
+            <name>NY_PFC_0909_V002.1_ocpprint</name>
+            <name>NY_PFC_0909_V002</name>
+            <name>NY_PFC_0907_V001</name>
+            <name>NY_PFC_0904</name>
+            <name>NY_PFC_0903</name>
+            <name>NY_PFC_0902</name>
+            <creation-uuid>4e45ce61-1f25-4270-a399-298f841c3584</creation-uuid>
+            <make-project-type>0</make-project-type>
+            <c-extensions>c</c-extensions>
+            <cpp-extensions/>
+            <header-extensions>h</header-extensions>
+            <asminc-extensions/>
+            <sourceEncoding>ISO-8859-1</sourceEncoding>
+            <make-dep-projects/>
+            <sourceRootList>
+                <sourceRootElem>.</sourceRootElem>
+            </sourceRootList>
+            <confList>
+                <confElem>
+                    <name>default</name>
+                    <type>2</type>
+                </confElem>
+            </confList>
+            <formatting>
+                <project-formatting-style>false</project-formatting-style>
+            </formatting>
+        </data>
+    </configuration>
+</project>
