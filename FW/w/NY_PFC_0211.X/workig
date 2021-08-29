@@ -1,0 +1,480 @@
+
+/******************************************************************************
+                                Include Files
+*******************************************************************************/
+#include "Include_headers.h"
+#include "mcc_generated_files\pin_manager.h"
+#define DEBUG_DATA  FALSE
+
+/******************************************************************************
+                             Variable Declaration
+*****************************************************************************/
+volatile uint16_t *PFC_AB_SHIFT_Ptr1;
+volatile uint16_t *PFC_AB_SHIFT_Ptr2;
+volatile uint16_t *PFC_PWM_PERIOD_Ptr;
+volatile uint16_t *PFC_DUTY_Ptr[PFC_CHANNEL];
+volatile uint16_t *PFC_ADC_TRIG_Ptr[PFC_CHANNEL];
+volatile uint16_t *ADCBUF_CT_Ptr[PFC_CHANNEL];
+
+uint16_t Vin_filt = 0;
+uint16_t VbusRefTemp = 0;
+uint16_t Soft_Start_Iteration = 2; // 1 = ~ 5ms 
+uint16_t Vbus_filt = 0;
+
+//IIN Variables
+int16_t Iref = 0;
+int16_t k1_i = K1_I;
+int16_t k2_i = K2_I;
+
+//Feed forward Control
+int16_t FForwardFactor = 0;
+int32_t FForward = 0;
+
+
+
+/*******************************************************************************
+ * Function:        ControlLoopInit
+ * Description:     Control loop init
+ * Calling:
+ ******************************************************************************/
+void __attribute__((__section__("APP_IMAGE"))) ControlLoopInit(void)
+{
+    PFC_PWM_PERIOD_Ptr = &PFC_PWMPERIOD;
+    PFC_DUTY_Ptr[PFC_A] = &PFC_PWMDUTY1;      // PDC1
+    PFC_ADC_TRIG_Ptr[PFC_A] = &ADCTRIG1;      // TRIG1
+    ADCBUF_CT_Ptr[PFC_A] = &CT_A_CURRENT_BUF; // ADCBUF3
+    PFC_AB_SHIFT_Ptr1 = &PFC_PHASE_SHIFT1;
+	PFC_AB_SHIFT_Ptr2 = &PFC_PHASE_SHIFT2;
+  //#if PFC_B_ON_BOARD  
+    PFC_DUTY_Ptr[PFC_B] = &PFC_PWMDUTY2;      // PDC2
+    PFC_ADC_TRIG_Ptr[PFC_B] = &ADCTRIG2;      // TRIG2
+    ADCBUF_CT_Ptr[PFC_B] = &CT_B_CURRENT_BUF; // ADCBUF0
+  //#endif
+
+    PfcPeriod = PFC_PWM_PERIOD1;
+    PfcPeriodBase = PFC_PWM_PERIOD1;
+	PTPER=PFC_PWM_PERIOD1;
+	
+	
+}
+
+/*******************************************************************************
+ * Function:        Control Loop Called from ADC3 Interrupt
+ * Parameters:
+ * Returned value:
+ * Description:     Control loop
+ * Calling:
+ ******************************************************************************/
+void __attribute__((__section__("APP_ISR_IMAGE"))) Control_Loop(void)
+{	
+ //   AC_NOK_PRI_Toggle();
+    static volatile int32_t u0_v = 0;
+    static volatile int32_t u1_v = 0;
+    static volatile int16_t e0_v = 0;
+    static volatile int16_t e1_v = 0;
+    static volatile int16_t vloop_out = 0;
+
+    static volatile int32_t u0_i[PFC_CHANNEL];
+    static volatile int32_t u1_i[PFC_CHANNEL];
+    static volatile int16_t e0_i[PFC_CHANNEL];
+    static volatile int16_t e1_i[PFC_CHANNEL];
+    static volatile int16_t Iin_CT[PFC_CHANNEL];
+    static volatile int32_t u0_K_i[PFC_CHANNEL];
+    static volatile int16_t PfcDuty[PFC_CHANNEL];
+
+    static uint16_t ClrKey = 0;
+    static uint8_t K_dyn = 0;
+    static uint16_t DynCnt = 0;
+    static int16_t FForward_ccm = 0;
+    static uint16_t SoftStartCnt = 0;
+
+    static int16_t Remaindertemp;
+    static int32_t wCalTemp;
+    static uint16_t uiBusVinDifference;
+    static int16_t VavgInvSquareTemp = Q12(1.0);
+    static uint32_t ulDummy;
+    static int16_t k1_v = K1_V;
+    static int16_t k2_v = K2_V;
+    k1_i = K1_I;
+    k2_i = K2_I;
+
+    if((*PFC_PWM_PERIOD_Ptr) != PfcPeriod)
+    {
+        *PFC_PWM_PERIOD_Ptr = PfcPeriod;
+        *PFC_AB_SHIFT_Ptr1 = (*PFC_PWM_PERIOD_Ptr) >> 1;
+		*PFC_AB_SHIFT_Ptr2 = (*PFC_PWM_PERIOD_Ptr) >> 1;
+    }
+ 
+    if (L_VOLTAGE_BUF > N_VOLTAGE_BUF)
+        Vin = (L_VOLTAGE_BUF - N_VOLTAGE_BUF);
+    else
+        Vin = (N_VOLTAGE_BUF - L_VOLTAGE_BUF);
+
+    //Vbus = (__builtin_divud(__builtin_muluu(BUS_VOLTAGE_BUF, 4096), 4096));
+    Vbus = BUS_VOLTAGE_BUF;
+	PRI_DATA.PFC_En=1;
+    if(PRI_DATA.PFC_En) // PFC is enabled by main control loop //PRI_DATA.PFC_En 
+    {    
+        // *********************Input and Output Sense Filtering********************         
+        Vin_filt = (__builtin_mulss(Vin_filt, K1_VIN) >> 15) + (__builtin_mulss(Vin, K2_VIN) >> 15);
+		Vbus_filt = (__builtin_mulss(Vbus_filt, K1_VBUS) >> 15) + (__builtin_mulss(Vbus, K2_VBUS) >> 15);
+        
+        if(((int) Vbus_filt - (int) Vin_filt) > (int) VBUS_GAP)
+            uiBusVinDifference = Vbus_filt - Vin_filt;
+        else
+            uiBusVinDifference = VBUS_GAP;
+
+        
+      
+        // *********************Input and Output Sense Filtering END********************        
+        // ************************************ current B loop *****************************
+      #if PFC_B_ON_BOARD 
+        wCalTemp = __builtin_divmodsd((__builtin_mulss(PfcDuty[PFC_B], Vbus_filt)), uiBusVinDifference, &Remaindertemp);
+        if(wCalTemp < 4096)
+            Iin_CT[PFC_B] = (__builtin_mulss(((*ADCBUF_CT_Ptr[PFC_B])), wCalTemp)) >> 12;
+        else
+            Iin_CT[PFC_B] = *ADCBUF_CT_Ptr[PFC_B];
+
+        e0_i[PFC_B] = Iref - Iin_CT[PFC_B];
+
+        if(e0_i[PFC_B] > I_ERROR_MAX)
+            e0_i[PFC_B] = I_ERROR_MAX;
+
+        u0_i[PFC_B] = u1_i[PFC_B] + (long) __builtin_mulss(e0_i[PFC_B], k1_i) + (long) __builtin_mulss(e1_i[PFC_B], k2_i);
+        u0_K_i[PFC_B] = u0_i[PFC_B] + FForward;
+
+        if(u0_K_i[PFC_B] > Max_u0_i)
+        {
+            u0_K_i[PFC_B] = Max_u0_i;
+            u0_i[PFC_B] = Max_u0_i - FForward;
+        }
+        else if(u0_K_i[PFC_B] < MIN_u0_I)
+        {
+            u0_i[PFC_B] = MIN_u0_I - FForward;
+            e0_i[PFC_B] = 0;
+            u0_K_i[PFC_B] = 0;
+        }
+
+        u1_i[PFC_B] = u0_i[PFC_B];
+        e1_i[PFC_B] = e0_i[PFC_B];
+
+        PfcDuty[PFC_B] = (int) (u0_K_i[PFC_B] >> 12);
+
+        #if PFC_B_ALWAYS_OFF 
+            *PFC_DUTY_Ptr[PFC_B] = 0;
+        #else
+            *PFC_DUTY_Ptr[PFC_B] = ((__builtin_mulss(PfcDuty[PFC_B], (*PFC_PWM_PERIOD_Ptr))) >> 12);
+			if(Vbus_filt > VBUS_DEBUG_REF_ADC)
+				{
+				 *PFC_DUTY_Ptr[PFC_B] = 0;
+				 } 
+        #endif
+        *PFC_ADC_TRIG_Ptr[PFC_B] = ((*PFC_DUTY_Ptr[PFC_B]) >> 1);        
+      #else
+        *PFC_DUTY_Ptr[PFC_B] = 0;
+        *PFC_ADC_TRIG_Ptr[PFC_B] = 0;        
+      #endif
+        // ************************************current B loop END************************
+  
+////            ************************************Soft Start *******************************
+        // if(PRI_DATA.CL_1st_PASS) // Check for First Iteration of the loop
+        // {
+            // VbusRefTemp = Vbus; // Assign Ref Voltage to DCBus Voltage
+
+            // Vbus_filt = Vbus;
+            // PRI_DATA.CL_1st_PASS = 0; // Clear the First Pass Flag
+        // }
+        // else
+        // {
+            // if(PRI_DATA.CL_SoftStart) // Check for SoftStart Flag Status
+            // {
+                // if (SoftStartCnt > Soft_Start_Iteration)
+                // {
+                    // if (VbusRefTemp < VbusRef)
+                        // VbusRefTemp++;
+                    // else if (VbusRefTemp > VbusRef)
+                        // VbusRefTemp--;
+                    // else
+                        // PRI_DATA.CL_SoftStart = 0;
+                    // SoftStartCnt = 0;
+                // }
+                // else
+                    // SoftStartCnt++;
+            // }
+        // }
+        // ************************************Soft Start END****************************
+        
+        // *********************************** Voltage Loop ******************************
+       // e0_v = VbusRefTemp - Vbus_filt;
+
+        
+        // *********************************** Voltage Loop ******************************
+        e0_v = VBUS_REF0_ACT_ADC_HL - Vbus_filt;
+ 
+        if((e0_v > V_ERROR_MAX) || (e0_v < V_ERROR_MIN))
+        {
+            if(PRI_DATA.A_ALERT_PFC)
+            {
+                if(K_dyn < 100)
+                    K_dyn++;
+            }
+            else
+            {
+                if(K_dyn < 50)
+                    K_dyn++;
+            }
+
+            k1_v = K1_V + 5;
+            k2_v = K2_V;
+
+            DynCnt = 0;
+            if(e0_v > V_ERROR_MAX)
+                e0_v = V_ERROR_MAX;
+            else if (e0_v < V_ERROR_MIN)
+                e0_v = V_ERROR_MIN;
+        }
+        else
+        {
+            k1_v = K1_V;
+            k2_v = K2_V;
+        }
+
+        if(K_dyn > 0)
+        {
+            e0_v *= K_dyn;
+            if(DynCnt > 100)
+            {
+                DynCnt = 0;
+                K_dyn--;
+            }
+            else
+                DynCnt++;
+        }
+
+        u0_v = u1_v + (long) __builtin_mulss(e0_v, k1_v) + (long) __builtin_mulss(e1_v, k2_v);
+	
+					
+        if(u0_v > MAX_u0_V)
+            u0_v = MAX_u0_V;
+        else if(u0_v < MIN_u0_V)
+        {	
+            u0_v = MIN_u0_V;
+            e0_v = 0;
+        }
+
+        if(PRI_DATA.A_BULK_OV_ALERT)
+        {
+            u0_v = 0;
+            e0_v = 0;
+
+        }
+
+        u1_v = u0_v;
+        e1_v = e0_v;
+
+        vloop_out = (int) (u0_v >> 15);
+        // *********************************** Voltage Loop END *************************
+        
+        // *********  Clear voltage loop output at light load ***************************
+       
+        if (vloop_out < VLOOP_LOWLOAD_L)
+            ClrKey = 0x55;
+        else if (vloop_out > VLOOP_LOWLOAD_H)
+            ClrKey = 0;
+
+        if(ClrKey == 0x55)
+        {
+            vloop_out = 0;
+            FForwardFactor = 0;
+            e1_i[PFC_A] = 0; 
+            u1_i[PFC_A] = 0;
+
+            #if PFC_B_ON_BOARD
+                e1_i[PFC_B] = 0;
+                u1_i[PFC_B] = 0;
+            #endif
+        }
+        
+        // *********  Clear voltage loop output at light load END ***********************
+       
+        // ************************************current A loop ***************************
+        wCalTemp = __builtin_divmodsd((__builtin_mulss(PfcDuty[PFC_A], Vbus_filt)), uiBusVinDifference, &Remaindertemp);
+        if(wCalTemp < 4096)
+            Iin_CT[PFC_A] = (__builtin_mulss(((*ADCBUF_CT_Ptr[PFC_A])), wCalTemp)) >> 12;
+        else
+            Iin_CT[PFC_A] = *ADCBUF_CT_Ptr[PFC_A];
+
+        e0_i[PFC_A] = Iref - Iin_CT[PFC_A];
+		
+        if (e0_i[PFC_A] > I_ERROR_MAX)
+            e0_i[PFC_A] = I_ERROR_MAX;
+		
+
+		
+        u0_i[PFC_A] = u1_i[PFC_A] + (long) __builtin_mulss(e0_i[PFC_A], k1_i) + (long) __builtin_mulss(e1_i[PFC_A], k2_i);
+
+        u0_K_i[PFC_A] = u0_i[PFC_A] + FForward;
+		
+        if(u0_K_i[PFC_A] > Max_u0_i)                                                               
+        {
+            u0_K_i[PFC_A] = Max_u0_i;
+            u0_i[PFC_A] = Max_u0_i - FForward;
+        }
+        else if(u0_K_i[PFC_A] < MIN_u0_I)
+        {	
+            u0_i[PFC_A] = MIN_u0_I - FForward;
+            e0_i[PFC_A] = 0;
+            u0_K_i[PFC_A] = 0;
+        }
+
+		
+        u1_i[PFC_A] = u0_i[PFC_A];
+        e1_i[PFC_A] = e0_i[PFC_A];
+
+        PfcDuty[PFC_A] = (int) (u0_K_i[PFC_A] >> 12);
+
+         #if PFC_A_ALWAYS_OFF
+            *PFC_DUTY_Ptr[PFC_A] = 0;
+        #else 
+
+            *PFC_DUTY_Ptr[PFC_A] = ((__builtin_mulss(PfcDuty[PFC_A], 0x38B1)) >> 12);
+
+
+		
+       #endif
+           
+		if(Vbus_filt > VBUS_DEBUG_REF_ADC)
+		{
+		 *PFC_DUTY_Ptr[PFC_A] = 0;
+		 } 
+        *PFC_ADC_TRIG_Ptr[PFC_A] = ((*PFC_DUTY_Ptr[PFC_A]) >> 1);   
+
+        // ************************************current A loop END************************
+
+        //**************************** Current loop Reference ***************************
+        
+        if(VavgInvSquareTemp < Vavg_Inv_Sq)
+            VavgInvSquareTemp += 5;
+        else if(VavgInvSquareTemp > Vavg_Inv_Sq)
+            VavgInvSquareTemp--;
+
+        wCalTemp = (int) ((__builtin_mulss(vloop_out, Vin_filt)) >> 12);
+        wCalTemp = (int) ((__builtin_mulss(wCalTemp, VavgInvSquareTemp)) >> 12);
+        
+
+		
+        Iref = (int) ((__builtin_mulss(wCalTemp, KM)) >> 12);
+       
+        if(Iref > MAX_IREF)
+            Iref = MAX_IREF;
+
+        //**************************** Current loop Reference END ***********************
+
+        /* ***************************** Duty feed forward ******************************************************************************* */
+		
+        /* ***************************** Duty feed forward ******************************************************************************* */
+        #if FEEDFORWARD_ENABLE
+
+          #if DCM_FF_CAL_ENABLE    
+            if(vloop_out > 10)
+            {
+                if(FForwardFactor < Q12(1.0))
+                    FForwardFactor = FForwardFactor + Q12(0.01);
+
+                if(FForwardFactor > Q12(1.0))
+                    FForwardFactor = Q12(1.0);
+            }
+            else if(vloop_out < 5)
+            {
+                if(FForwardFactor > 0)
+                    FForwardFactor--;
+            }
+
+            /* ************************ CCM duty feed forward ************************************** */
+            if(VbusRefTemp > Vin_filt)
+            {
+                FForward_ccm = __builtin_divmodsd((((long) VbusRefTemp - Vin_filt) << 12), VbusRefTemp, &Remaindertemp);
+                if(FForward_ccm > MAX_FFORWARD_CCM)
+                    FForward_ccm = MAX_FFORWARD_CCM;
+            }
+            else
+                FForward_ccm = 0;
+            /* ************************ CCM duty feed forward END  ************************************** */
+
+        /*  **************************************************************************************************
+        D = SquareRoot( 2*L*Iref*(Uo - Ui)/(Uo * Ui * Ts) = SquareRoot( ((2 * L / Ts) * Iref * Dccm)/Ui  )       
+            K = (2 * L / Ts) * (IrefMax / VinMax) = 
+         ****************************************************************************************************	*/
+
+         /* ************************ DCM duty feed forward ****************************************** */
+            if(PRI_DATA.VAC_Range_LL)       //if LOW Line
+                ulDummy = __builtin_muluu(Iref, KL) >> 12;  
+            else//Hifgh Line
+                ulDummy = __builtin_muluu(Iref, KL_115) >> 12;            //
+            
+            if(ulDummy < Q12(0.015))            // if Iref = 0, Vin = 0, Feedford change too fast
+                ulDummy = Q12(0.015);
+
+            if((ulDummy < Vin_filt) )           
+            {
+                ulDummy = __builtin_divud((ulDummy << 12), Vin_filt);
+                ulDummy = (uint16_t) SQRTQ15lin10_FS(__builtin_muluu(ulDummy, FForward_ccm) >> 9); // Q15 /* Execute Time: 1.5us, SquareRoot: 1us */
+                ulDummy = (__builtin_muluu(ulDummy, 32767)) >> 18; // Q12
+
+                if(PRI_DATA.FF_Boost_1)
+                    ulDummy = (__builtin_muluu(ulDummy, Q10(1.15))) >> 10;
+
+                if((ulDummy > FForward_ccm))
+                    FForward = FForward_ccm;
+                else
+                    FForward = ulDummy;
+            }
+            else
+                FForward = FForward_ccm;
+        /* ************************ DCM duty feed forward END*********************************** */
+
+            FForward = (__builtin_mulss(FForward, FForwardFactor));
+
+          #else
+            if(vloop_out > 30)
+            {
+                if(FForwardFactor < Q12(1.0))
+                    FForwardFactor++;
+            }
+            else if(vloop_out < 10)
+            {
+                if(FForwardFactor > 0)
+                    FForwardFactor--;
+            }
+            #if FEEDFORWARD_SIMPLIFY // Duty = 1 - Vin / Vinmax
+                FForward_ccm = Q12(1.0) - Vin_filt;
+            #else // Duty = 1 - Vin / Vo
+                if(Vbus_filt > Vin_filt)
+                {
+                    FForward_ccm = __builtin_divmodsd((((long) Vbus_filt - Vin_filt) << 12), Vbus_filt, &Remaindertemp);
+                    if(FForward_ccm > MAX_FFORWARD_CCM)
+                        FForward_ccm = MAX_FFORWARD_CCM;
+                }
+                else
+                    FForward_ccm = 0;
+            #endif
+            FForward = (__builtin_mulss(FForward_ccm, FForwardFactor));
+          #endif
+
+        #else
+            FForward = 0;
+        #endif
+        /* ***************************** Duty feed forward END *********************************************************************** */   
+
+        /* ***************************** Duty feed forward END *********************************************************************** */   
+
+    } // if (PRI_DATA.PFC_EN)
+
+
+}
+
+/*****************************************************************************/
+
+/*
+ * End of file
+ */
